@@ -13,7 +13,7 @@ for i in range(len(output['shorelines'])):
     sl = output['shorelines'][i]
     plt.plot(sl[:,0], sl[:,1], '.', markersize=1)
 
-plt.title("Superposition de toutes les lignes de côte extraites (Hội An)")
+plt.title("Extracted Shorelines (Hội An)")
 plt.xlabel("Easting (m)")
 plt.ylabel("Northing (m)")
 plt.axis('equal')

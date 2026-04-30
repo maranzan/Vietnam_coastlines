@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 from coastsat import SDS_transects
 from shapely.geometry import LineString
+import geopandas as gpd
 
 data_root = os.path.join(os.getcwd(), 'data')
 output_master_file = 'vietnam_master_dataset.csv'
@@ -41,10 +42,32 @@ for site in sites:
         start = [p1.x - ux * (transect_length/2), p1.y - uy * (transect_length/2)]
         end = [p1.x + ux * (transect_length/2), p1.y + uy * (transect_length/2)]
         transects[f'TS_{i+1:03d}'] = np.array([start, end])
+    
+    print(f"Sauvegarde des transects géographiques pour {site}...")
+    features = []
+    for ts_id, coords in transects.items():
+        # Créer une ligne à partir des coordonnées start/end
+        ts_line = LineString(coords)
+        features.append({'id': ts_id, 'geometry': ts_line})
+    
+    gdf_transects = gpd.GeoDataFrame(features)
+    
+    # Assigner le système de coordonnées (CoastSat stocke ça dans output['epsg'])
+    if 'epsg' in output:
+        gdf_transects.set_crs(epsg=output['epsg'], inplace=True)
+        gdf_transects = gdf_transects.to_crs(epsg=4326)
+    else:
+        # Au cas où, on force un système par défaut si absent (à ajuster si besoin)
+        print("Attention: Pas d'EPSG trouvé dans l'output, le GeoJSON n'aura pas de projection définie.")
+        
+    geojson_filename = os.path.join(site_path, f'{site}_transects.geojson')
+    gdf_transects.to_file(geojson_filename, driver='GeoJSON')
+    print(f"GeoJSON créé : {geojson_filename}")
 
     settings_transects = {
         'along_dist': 25, 'min_points': 3, 'max_std': 15,
-        'max_range': 30, 'min_chainage': -100, 'multiple_inter': 'auto'
+        'max_range': 30, 'min_chainage': -100, 'multiple_inter': 'auto',
+        'auto_prc': 0.1
     }
     cross_distance = SDS_transects.compute_intersection_QC(output, transects, settings_transects)
 
