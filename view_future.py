@@ -70,5 +70,5 @@ for _, row in gdf.iterrows():
     folium.PolyLine(points, color=color, weight=5, opacity=0.8,
                     popup=f"Transect: {row['id']}<br>Evolution: {row['diff']:.2f}m").add_to(m)
 
-m.save(f'{site}_erosion_map.html')
-print(f"Finished. Open '{site}_erosion_map.html'")
+m.save(f'data/{site}_erosion_map.html')
+print(f"Finished. Open 'data/{site}_erosion_map.html'")
