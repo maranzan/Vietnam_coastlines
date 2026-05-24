@@ -22,3 +22,4 @@
 /examples/tide_model_clipping/*.yaml
 .vscode/settings.json
 .vscode/launch.json
+data/*.npy

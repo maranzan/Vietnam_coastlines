@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import pickle
 
 # 1. Load the model, the scaler, and the data
-from model_erosion import ErosionLSTM # Assuming class is in your script
+from coastsat_repo.model1.model_erosion import ErosionLSTM # Assuming class is in your script
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = ErosionLSTM(input_size=1, hidden_size=64, num_layers=2, output_size=1)
@@ -31,7 +31,7 @@ with torch.no_grad():
     prediction_meters = scaler.inverse_transform(prediction_scaled.cpu().numpy())
     actual_meters = scaler.inverse_transform(test_data[-1:].reshape(-1, 1))
 
-print(f"📊 Result for {target_id}:")
+print(f"Result for {target_id}:")
 print(f"Last known position: {actual_meters[0][0]:.2f} m")
 print(f"AI Predicted next position: {prediction_meters[0][0]:.2f} m")
 

@@ -25,7 +25,7 @@ with open('data/scaler.pkl', 'rb') as f:
     scaler = pickle.load(f)
 
 df = pd.read_csv('data/dataset_ready_for_ia.csv')
-target_id = df['unique_id'].unique()[0] 
+target_id = df['unique_id'].unique()[14000] 
 data_series = list(df[df['unique_id'] == target_id]['distance_scaled'].values)
 
 # --- FORECAST LOOP (Predict next 24 months) ---
