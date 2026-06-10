@@ -6,7 +6,7 @@ from coastsat import SDS_transects
 from shapely.geometry import LineString
 
 data_root = os.path.join(os.getcwd(), 'data')
-output_master_file = 'vietnam_master_dataset.csv'
+output_master_file = 'data/vietnam_master_dataset.csv'
 spacing = 50 
 transect_length = 200 
 

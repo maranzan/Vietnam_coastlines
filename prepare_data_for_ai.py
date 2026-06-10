@@ -65,15 +65,3 @@ print(f"Final Data Range: Min={df_final['distance_scaled'].min():.2f} | Max={df_
 print(f"Success! Cleaned dataset saved to 'data/dataset_ready_for_ia.csv'")
 print(f"Scaler saved to 'data/scaler.pkl' (don't lose this!)")
 
-# --- 5. SAVING OUTPUTS ---
-os.makedirs('data', exist_ok=True)
-
-df_final.to_csv('data/dataset_ready_for_ia.csv', index=False)
-
-with open('data/scaler.pkl', 'wb') as f:
-    pickle.dump(scaler, f)
-
-print("-" * 30)
-print(f"Final Data Range: Min={df_final['distance_scaled'].min():.2f} | Max={df_final['distance_scaled'].max():.2f}")
-print(f"Success! Cleaned dataset saved to 'data/dataset_ready_for_ia.csv'")
-print(f"Scaler saved to 'data/scaler.pkl' (don't lose this!)")
