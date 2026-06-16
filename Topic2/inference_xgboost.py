@@ -10,7 +10,7 @@ warnings.filterwarnings('ignore')
 # 1. SIMULATION CONFIGURATION
 # ---------------------------------------------------------
 DATA_PATH = 'data/vietnam_monthly_dataset.csv'
-TARGET_TRANSECT = 'Mui_Ne_TS_0006'  # Change
+TARGET_TRANSECT = 'QN_Nui_Thanh_TS_2281'  # Change
 DESIRED_PREDICT_MONTHS = 12
 
 print(f"Loading data for transect: {TARGET_TRANSECT}...")
