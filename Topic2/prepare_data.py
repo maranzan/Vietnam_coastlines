@@ -7,14 +7,14 @@ warnings.filterwarnings('ignore')
 print("1. Chargement des données brutes...")
 df = pd.read_csv('data/vietnam_ml_dataset.csv')
 
-# Exclure les zones d'embouchure (trop chaotiques)
-df = df[df['in_river_zone'] == 0].copy()
+# On GARDE tous les transects (suppression du filtre in_river_zone == 0)
 df['date'] = pd.to_datetime(df['date'])
 df['YearMonth'] = df['date'].dt.to_period('M')
 
 print("2. Agrégation mensuelle des données...")
 aggregation_rules = {
     'site_name': 'first',
+    'in_river_zone': 'first',  # <-- AJOUTÉ ICI pour préserver l'étiquette
     'latitude': 'first',
     'longitude': 'first',
     'orientation_deg': 'first',
@@ -31,7 +31,10 @@ aggregation_rules = {
 }
 
 existing_cols = {k: v for k, v in aggregation_rules.items() if k in df.columns}
-existing_cols['cross_distance_m'] = 'mean'
+
+# Sécurité pour être sûr que cross_distance_m est bien pris en compte
+if 'cross_distance_m' not in existing_cols and 'cross_distance_m' in df.columns:
+    existing_cols['cross_distance_m'] = 'mean'
 
 # Groupement par mois et par transect
 df_monthly = df.groupby(['segment_id', 'YearMonth']).agg(existing_cols).reset_index()
