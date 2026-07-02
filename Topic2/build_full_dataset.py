@@ -42,6 +42,31 @@ LANCER
 ──────
    python build_full_dataset.py
    # Désactiver une source :  ERA5_ENABLED = False  /  GEE_ENABLED = False
+
+────────────────────────────────────────────────────────────────────────────
+CORRECTIFS (ce fichier) :
+   1) Les shorelines CoastSat (output['shorelines'][i]) contiennent souvent
+      PLUSIEURS morceaux de côte disjoints (nuages, îles, gaps de détection,
+      bords d'image, embouchures...). Relier tous les points consécutifs par
+      une LineString unique crée des "coutures" artificielles en ligne droite
+      qui traversent la terre. build_transects() découpe maintenant la
+      shoreline en sous-segments continus (split_shoreline_segments) AVANT de
+      générer les transects.
+
+   2) Sur les sites à large emprise, CoastSat détecte parfois un réseau de
+      bassins d'aquaculture / canaux interconnectés comme une SEULE masse
+      d'eau continue (les bassins communiquent entre eux). Le contour de
+      cette masse d'eau est alors un contour réellement continu — donc non
+      coupé par le correctif (1) — mais qui serpente sur des dizaines de km
+      à l'intérieur d'une petite zone 2D, au lieu de suivre une ligne de
+      côte. split_shoreline_segments() calcule maintenant l'élongation de
+      chaque segment (PCA : rapport axe principal / axe secondaire) et
+      écarte ceux qui ne sont pas suffisamment allongés (< MIN_SEGMENT_
+      ELONGATION, 4.0 par défaut) : une vraie côte est fine et allongée,
+      un réseau de bassins forme un enchevêtrement compact quelle que soit
+      sa longueur totale. Le filtre par longueur minimale (MIN_SEGMENT_
+      LENGTH_M) reste utile en complément pour les petits artefacts isolés.
+────────────────────────────────────────────────────────────────────────────
 """
 
 import os, sys, json, pickle, logging, warnings
@@ -72,6 +97,34 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 TRANSECT_SPACING = 100    # mètres
 TRANSECT_LENGTH  = 200    # mètres
+
+# Distance max (en mètres, dans le CRS EPSG_COASTSAT) entre deux points
+# consécutifs d'une shoreline pour être considérés comme le MEME morceau
+# de côte. Au-delà : on considère qu'il y a un gap / une couture -> on coupe.
+# A ajuster selon la résolution Sentinel-2 (10-15 m/pixel) : une vraie
+# discontinuité de détection saute généralement de plusieurs dizaines à
+# centaines de mètres d'un coup.
+MAX_SHORELINE_GAP_M = 75
+
+# Longueur minimale (m) d'un sous-segment de shoreline, APRES découpage par
+# gap, pour être conservé comme "vraie côte". En dessous de ce seuil, on
+# considère qu'il s'agit d'un artefact de classification eau/terre : bord
+# de bassin d'aquaculture, rizière inondée, mare, piscine, etc. — ces
+# structures rectangulaires très fréquentes dans les deltas vietnamiens
+# créent des quadrillages de "shorelines" à l'intérieur des terres.
+# A ajuster selon le site : augmenter si des morceaux de vraie côte
+# (petites baies, anses) sont encore filtrés à tort.
+MIN_SEGMENT_LENGTH_M = 500
+
+# Élongation minimale (ratio écart-type axe principal / axe secondaire,
+# via PCA) pour qu'un segment soit considéré comme "de la vraie côte".
+# Une vraie côte est un tracé fin et allongé dans une direction dominante.
+# Un réseau de bassins d'aquaculture/canaux interconnectés forme au
+# contraire un enchevêtrement compact dans une zone 2D : le trajet peut
+# être très long (des dizaines de km en serpentant), mais reste confiné
+# dans un petit périmètre -> élongation proche de 1. On écarte donc tout
+# segment dont l'élongation est < ce seuil, quelle que soit sa longueur.
+MIN_SEGMENT_ELONGATION = 4.0
 
 EPSG_COASTSAT = 'EPSG:3857'
 EPSG_WGS84    = 'EPSG:4326'
@@ -107,19 +160,121 @@ _to_utm = pyproj.Transformer.from_crs(EPSG_WGS84, EPSG_UTM48N,  always_xy=True)
 # MODULE 1 — GÉOMÉTRIE & TRANSECTS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def segment_elongation(seg):
+    """
+    Rapport d'élongation d'un segment via PCA : écart-type le long de
+    l'axe principal / écart-type le long de l'axe secondaire.
+
+    - Une ligne fine et allongée (vraie côte) a une élongation élevée
+      (typiquement > 5-10) : la variance est concentrée sur un seul axe.
+    - Un enchevêtrement compact dans une zone 2D (réseau de bassins
+      d'aquaculture/canaux interconnectés) a une élongation proche de 1,
+      même si le trajet total (la longueur du contour) est très long.
+    """
+    pts = np.asarray(seg, dtype=float)
+    if len(pts) < 3:
+        return np.inf  # trop peu de points pour juger -> on ne filtre pas dessus
+    centered = pts - pts.mean(axis=0)
+    cov = np.cov(centered.T)
+    eigvals = np.linalg.eigvalsh(cov)  # ordre croissant
+    minor, major = max(eigvals[0], 1e-9), eigvals[1]
+    return float(np.sqrt(major / minor))
+
+
+def split_shoreline_segments(shoreline_xy, max_gap=MAX_SHORELINE_GAP_M,
+                              min_length=MIN_SEGMENT_LENGTH_M,
+                              min_elongation=MIN_SEGMENT_ELONGATION):
+    """
+    Découpe un tableau de points de shoreline en plusieurs sous-segments
+    CONTINUS, en coupant partout où la distance entre deux points
+    consécutifs dépasse `max_gap`.
+
+    Ceci évite que shapely.LineString relie par une ligne droite deux
+    morceaux de côte totalement déconnectés (nuages, îles, gaps de
+    détection, bords d'image, embouchures...), ce qui créerait des
+    transects parasites en ligne droite traversant la terre.
+
+    Filtre ensuite les segments qui ne ressemblent pas à une côte :
+    - trop courts (< min_length) : petits artefacts isolés.
+    - pas assez élancés (< min_elongation) : réseaux de bassins
+      d'aquaculture / canaux interconnectés, qui forment un contour
+      continu (donc non coupé par le filtre de gap) mais serpentent dans
+      une zone 2D compacte plutôt que de suivre une ligne de côte.
+
+    Retourne une liste de np.ndarray (chacun de shape (N, 2), N >= 2).
+    """
+    pts = np.asarray(shoreline_xy, dtype=float)
+    if len(pts) < 2:
+        return []
+
+    dists  = np.hypot(np.diff(pts[:, 0]), np.diff(pts[:, 1]))
+    breaks = np.where(dists > max_gap)[0] + 1
+    raw_segments = np.split(pts, breaks)
+
+    segments = []
+    n_dropped_short = 0
+    n_dropped_blob  = 0
+    for seg in raw_segments:
+        if len(seg) < 2:
+            continue
+        seg_len = np.hypot(np.diff(seg[:, 0]), np.diff(seg[:, 1])).sum()
+        if seg_len < min_length:
+            n_dropped_short += 1
+            continue
+        elong = segment_elongation(seg)
+        if elong < min_elongation:
+            n_dropped_blob += 1
+            continue
+        segments.append(seg)
+
+    if n_dropped_short or n_dropped_blob:
+        log.info(f"    split_shoreline_segments : {n_dropped_short} segment(s) "
+                 f"courts (< {min_length} m) + {n_dropped_blob} segment(s) "
+                 f"non-linéaires (élongation < {min_elongation}, probables "
+                 f"bassins/canaux) écartés")
+
+    return segments
+
+
 def build_transects(shoreline_xy):
-    line  = LineString(shoreline_xy)
-    dists = np.arange(0, line.length, TRANSECT_SPACING)
+    """
+    Construit les transects perpendiculaires à la côte, tous les
+    TRANSECT_SPACING mètres, sur CHAQUE sous-segment continu de la
+    shoreline (voir split_shoreline_segments).
+    """
+    segments = split_shoreline_segments(shoreline_xy)
+    if not segments:
+        log.warning("    build_transects : aucune shoreline exploitable après découpage")
+        return {}
+
     transects = {}
-    for i, d in enumerate(dists):
-        p1  = line.interpolate(d)
-        p2  = line.interpolate(min(d + 0.5, line.length))
-        dx, dy = p2.x - p1.x, p2.y - p1.y
-        mag    = max(np.hypot(dx, dy), 1e-9)
-        ux, uy = -dy / mag, dx / mag
-        start  = [p1.x - ux * TRANSECT_LENGTH/2, p1.y - uy * TRANSECT_LENGTH/2]
-        end    = [p1.x + ux * TRANSECT_LENGTH/2, p1.y + uy * TRANSECT_LENGTH/2]
-        transects[f'TS_{i+1:04d}'] = np.array([start, end])
+    idx = 0
+    n_skipped = 0
+
+    for seg_pts in segments:
+        line = LineString(seg_pts)
+        if line.length <= 0:
+            continue
+
+        dists = np.arange(0, line.length, TRANSECT_SPACING)
+        for d in dists:
+            idx += 1
+            p1 = line.interpolate(d)
+            p2 = line.interpolate(min(d + 0.5, line.length))
+            dx, dy = p2.x - p1.x, p2.y - p1.y
+            mag    = max(np.hypot(dx, dy), 1e-9)
+            ux, uy = -dy / mag, dx / mag
+            start  = [p1.x - ux * TRANSECT_LENGTH/2, p1.y - uy * TRANSECT_LENGTH/2]
+            end    = [p1.x + ux * TRANSECT_LENGTH/2, p1.y + uy * TRANSECT_LENGTH/2]
+            transects[f'TS_{idx:04d}'] = np.array([start, end])
+
+    n_segments = len(segments)
+    if n_segments > 1:
+        log.info(f"    build_transects : shoreline découpée en {n_segments} segments "
+                 f"continus (gap max toléré = {MAX_SHORELINE_GAP_M} m) → {idx} transects")
+    else:
+        log.info(f"    build_transects : {idx} transects (1 segment continu)")
+
     return transects
 
 
@@ -291,8 +446,6 @@ def extract_spectral_indices(output, site_path):
 # ══════════════════════════════════════════════════════════════════════════════
 
 import zipfile
-import pandas as pd
-import numpy as np
 
 def _fetch_era5_one_year(c, year, area, tmp_path):
     """Télécharge ERA5 pour une seule année. Retourne DataFrame ou None."""
@@ -324,20 +477,20 @@ def _fetch_era5_one_year(c, year, area, tmp_path):
         nc_files_extracted.append(tmp_path)
 
     import netCDF4 as nc4
-    
+
     data_dict = {}
     ts = None
 
     # 2. Parcourir chaque fichier extrait pour trouver les variables éparpillées
     for nc_file in nc_files_extracted:
         ds = nc4.Dataset(str(nc_file))
-        
+
         # Récupération de l'axe temporel (on ne le fait qu'une fois)
         if ts is None:
             if 'time' in ds.variables: t_var = 'time'
             elif 'valid_time' in ds.variables: t_var = 'valid_time'
             else: t_var = next((v for v in ds.variables if 'time' in v.lower()), None)
-            
+
             if t_var:
                 ts = nc4.num2date(ds[t_var][:], ds[t_var].units)
 
@@ -349,7 +502,7 @@ def _fetch_era5_one_year(c, year, area, tmp_path):
                 if hasattr(d, 'mask'): a[d.mask] = np.nan
                 # Moyenne spatiale si 3D (time, lat, lon)
                 data_dict[v_target] = a.mean(axis=tuple(range(1, a.ndim))) if a.ndim > 1 else a
-        
+
         ds.close()
         nc_file.unlink(missing_ok=True) # Nettoyage immédiat du fichier .nc
 
@@ -360,7 +513,7 @@ def _fetch_era5_one_year(c, year, area, tmp_path):
 
     u10 = data_dict['u10']
     v10 = data_dict['v10']
-    
+
     # 4. Construction du DataFrame final
     df = pd.DataFrame({
         'datetime':   pd.to_datetime([t.strftime('%Y-%m-%d %H:%M') for t in ts]) if ts is not None else [],
@@ -370,7 +523,7 @@ def _fetch_era5_one_year(c, year, area, tmp_path):
         'wind_speed': np.hypot(u10, v10),
         'wind_dir':   (np.degrees(np.arctan2(u10, v10)) + 360) % 360,
     }).set_index('datetime')
-    
+
     return df
 
 def fetch_era5(site_name, dates, bbox):
@@ -569,6 +722,39 @@ def gee_tide(site_name, lat, lon, dates):
 # MODULE 7 — METADATA CoastSat (cloud_cover, satellite)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def select_reference_date_index(dates, obs_meta):
+    """
+    Choisit l'index de la date à utiliser comme référence géométrique pour
+    build_transects(), au lieu de systématiquement prendre dates[0].
+
+    Critère : cloud_cover minimal parmi les dates avec georef_ok == 1.
+    Si aucune métadonnée n'est disponible (obs_meta vide), retombe sur 0
+    (comportement d'origine).
+    """
+    if not obs_meta:
+        return 0, None
+
+    candidates = []
+    for i, d in enumerate(dates):
+        ds = str(pd.Timestamp(d).date())
+        m = obs_meta.get(ds)
+        if m is None:
+            continue
+        cc = m.get('cloud_cover', np.nan)
+        georef_ok = m.get('georef_ok', np.nan)
+        if np.isnan(cc):
+            continue
+        # Pénalise fortement les dates avec géoréférencement raté
+        penalty = 0.0 if georef_ok == 1 else 1.0
+        candidates.append((i, cc + penalty, cc))
+
+    if not candidates:
+        return 0, None
+
+    best_i, _, best_cc = min(candidates, key=lambda x: x[1])
+    return best_i, best_cc
+
+
 def load_obs_metadata(site_path, site_name):
     """
     Retourne dict {date_str: {cloud_cover, satellite, georef_ok}}.
@@ -646,8 +832,27 @@ def process_site(site_name):
     if not dates or not shorelines:
         log.warning(f"[SKIP]    {site_name} — données vides"); return None
 
-    # Transects
-    transects = build_transects(shorelines[0])
+    # Metadata observations (chargées AVANT les transects pour pouvoir
+    # choisir la meilleure date de référence géométrique)
+    obs_meta = load_obs_metadata(site_path, site_name)
+
+    # Choix de la date de référence : la moins nuageuse plutôt que la
+    # première venue (shorelines[0] peut être une date de mauvaise
+    # qualité, ce qui produit une géométrie de côte incomplète/erratique)
+    ref_idx, ref_cc = select_reference_date_index(dates, obs_meta)
+    if ref_cc is not None:
+        log.info(f"          date de référence géométrique : {dates[ref_idx].date()} "
+                 f"(index {ref_idx}, cloud_cover={ref_cc:.2f})")
+    else:
+        log.info(f"          date de référence géométrique : {dates[ref_idx].date()} "
+                 f"(index {ref_idx}, pas de metadata cloud_cover disponible)")
+
+    # Transects (construits sur la date de référence choisie ci-dessus,
+    # et robustes aux shorelines discontinues / réseaux de bassins grâce
+    # au split par gap + filtre longueur/élongation)
+    transects = build_transects(shorelines[ref_idx])
+    if not transects:
+        log.warning(f"[SKIP]    {site_name} — aucun transect généré"); return None
     ts_meta   = transect_metadata(transects)
     log.info(f"          {len(transects)} transects × {len(dates)} dates")
 
@@ -656,9 +861,6 @@ def process_site(site_name):
 
     # NDVI/NDWI
     spectral = extract_spectral_indices(output, site_path)
-
-    # Metadata observations
-    obs_meta = load_obs_metadata(site_path, site_name)
 
     # ERA5
     bbox    = SITES_BBOX.get(site_name, [108.0,10.0,109.0,17.0])
@@ -763,6 +965,9 @@ if __name__ == '__main__':
     log.info("═"*65)
     log.info("  VIETNAM COASTAL ML DATASET BUILDER")
     log.info(f"  ERA5={'ON' if ERA5_ENABLED else 'OFF'}   GEE={'ON' if GEE_ENABLED else 'OFF'}")
+    log.info(f"  MAX_SHORELINE_GAP_M = {MAX_SHORELINE_GAP_M} m")
+    log.info(f"  MIN_SEGMENT_LENGTH_M = {MIN_SEGMENT_LENGTH_M} m")
+    log.info(f"  MIN_SEGMENT_ELONGATION = {MIN_SEGMENT_ELONGATION}")
     log.info("═"*65)
 
     sites = sorted([d.name for d in DATA_ROOT.iterdir()

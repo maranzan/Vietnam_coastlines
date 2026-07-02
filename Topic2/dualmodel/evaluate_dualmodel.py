@@ -1,163 +1,95 @@
 import pandas as pd
 import numpy as np
+import json
+import matplotlib.pyplot as plt
 from xgboost import XGBRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import warnings
-import time
 
 warnings.filterwarnings('ignore')
 
-# ---------------------------------------------------------
-# 1. EVALUATION CONFIGURATION
-# ---------------------------------------------------------
-DATA_PATH = 'data/vietnam_monthly_dataset.csv'
-PREDICT_MONTHS = 12       # Standard prediction horizon (1 year)
-MIN_TOTAL_MONTHS = 30     # Require history + future test data
+# --- CONFIGURATION ---
+DATA_PATH = 'data/vietnam_ml_dataset.csv'
+MODEL_DIR = 'models'
 
-print("=" * 60)
-print("  STARTING DUAL-MODEL AUTOREGRESSIVE EVALUATION")
-print(f"  Prediction horizon : {PREDICT_MONTHS} months")
-print("=" * 60)
+print("1. Loading Data and Pre-Trained Models...")
+# Load feature names used for training
+with open(f'{MODEL_DIR}/training_features.json', 'r') as f:
+    training_features = json.load(f)
 
-# Load and prepare data
+# Load XGBoost models
+model_coast = XGBRegressor()
+model_coast.load_model(f'{MODEL_DIR}/coast_model.json')
+
+model_river = XGBRegressor()
+model_river.load_model(f'{MODEL_DIR}/river_model.json')
+
+# Prepare data (exactly as done during training)
 df = pd.read_csv(DATA_PATH)
-df['YearMonth'] = pd.to_datetime(df['YearMonth'].astype(str))
-df = df.sort_values(by=['segment_id', 'YearMonth']).reset_index(drop=True)
+df['date'] = pd.to_datetime(df['date'])
+df = df.sort_values(by=['segment_id', 'date'])
+
+df['lag_1_change'] = df.groupby('segment_id')['shoreline_change_m'].shift(1)
+df['rolling_3_change'] = df.groupby('segment_id')['shoreline_change_m'].transform(
+    lambda x: x.shift(1).rolling(window=3, min_periods=1).mean()
+)
+
+# Convert text categories for XGBoost compatibility
 df['site_name'] = df['site_name'].astype('category')
+df['satellite'] = df['satellite'].astype('category')
 
-# Define features, strictly excluding the target and the routing label
-features = [
-    'site_name', 'orientation_deg', 'slope_deg', 'elevation_m', 'dist_river_m',
-    'Hs_mean_7d', 'Hs_max_7d', 'wave_period_s', 'wave_dir_deg', 
-    'wind_mean_7d', 'wind_dir_deg'
-]
+# Drop rows where the target or features are missing (needed for comparison)
+target = 'shoreline_change_m'
+df_eval = df.dropna(subset=[target, 'lag_1_change', 'rolling_3_change']).copy()
 
-# ---------------------------------------------------------
-# 2. IDENTIFYING VALID TRANSECTS
-# ---------------------------------------------------------
-counts = df['segment_id'].value_counts()
-valid_transects = counts[counts >= MIN_TOTAL_MONTHS].index.tolist()
+print("2. Running Predictions on Historical Data...")
+mask_coast = df_eval['in_river_zone'] == 0
+mask_river = df_eval['in_river_zone'] == 1
 
-if not valid_transects:
-    raise ValueError(f"No transect has {MIN_TOTAL_MONTHS} months of data.")
+# The model predicts "blindly" based on each month's conditions
+if mask_coast.sum() > 0:
+    df_eval.loc[mask_coast, 'pred_change'] = model_coast.predict(df_eval.loc[mask_coast, training_features])
+if mask_river.sum() > 0:
+    df_eval.loc[mask_river, 'pred_change'] = model_river.predict(df_eval.loc[mask_river, training_features])
 
-print(f"Number of qualified transects for testing: {len(valid_transects)}\n")
+print("\n3. Calculating Performance Metrics...")
 
-# Base configurations from your training script
-params_coast = {
-    'n_estimators': 500, 
-    'learning_rate': 0.05, 
-    'max_depth': 5, 
-    'enable_categorical': True, 
-    'tree_method': 'hist',
-    'random_state': 42,
-    'n_jobs': -1
-}
+def print_metrics(name, y_true, y_pred):
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mae = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    print(f"=== {name} ===")
+    print(f"  RMSE : {rmse:.2f} m (Root Mean Squared Error)")
+    print(f"  MAE  : {mae:.2f} m (Mean Absolute Error)")
+    print(f"  R²   : {r2:.3f}  (Prediction Quality, max=1.0)\n")
 
-params_river = {
-    'n_estimators': 400, 
-    'learning_rate': 0.05, 
-    'max_depth': 4, 
-    'enable_categorical': True, 
-    'tree_method': 'hist',
-    'random_state': 42,
-    'n_jobs': -1
-}
+# Display evaluation scores
+print_metrics("GLOBAL PERFORMANCE (Coast + River)", df_eval[target], df_eval['pred_change'])
+if mask_coast.sum() > 0:
+    print_metrics("COASTAL MODEL ONLY", df_eval.loc[mask_coast, target], df_eval.loc[mask_coast, 'pred_change'])
+if mask_river.sum() > 0:
+    print_metrics("RIVER/ESTUARY MODEL ONLY", df_eval.loc[mask_river, target], df_eval.loc[mask_river, 'pred_change'])
 
-# ---------------------------------------------------------
-# 3. EVALUATION LOOP
-# ---------------------------------------------------------
-results = []
-start_time = time.time()
+print("4. Generating Evaluation Plot...")
+plt.figure(figsize=(10, 8))
 
-for i, target in enumerate(valid_transects):
-    transect_data = df[df['segment_id'] == target].copy()
-    
-    # Identify the zone to route to the correct model
-    is_river = transect_data['in_river_zone'].iloc[0] == 1
-    
-    # Split Past / Future
-    history_data = transect_data.iloc[:-PREDICT_MONTHS]
-    future_data  = transect_data.iloc[-PREDICT_MONTHS:]
-    
-    # Prevent data leakage: Hide the future of THIS transect
-    # And filter the training data to match the zone (Coast vs River)
-    train_mask = (df['in_river_zone'] == (1 if is_river else 0)) & \
-                 ~((df['segment_id'] == target) & (df['YearMonth'] >= future_data['YearMonth'].iloc[0]))
-    
-    train_df = df[train_mask]
-    X_train = train_df[features]
-    y_train = train_df['monthly_change_m']
-    
-    # Instantiate and train the routed model
-    if is_river:
-        model = XGBRegressor(**params_river)
-    else:
-        model = XGBRegressor(**params_coast)
-        
-    model.fit(X_train, y_train)
-    
-    # Autoregressive simulation
-    current_position = history_data['cross_distance_m'].iloc[-1]
-    predicted_positions = []
-    
-    for month in range(PREDICT_MONTHS):
-        current_weather = future_data[features].iloc[[month]]
-        predicted_change = model.predict(current_weather)[0]
-        current_position += predicted_change
-        predicted_positions.append(current_position)
-        
-    # Calculate physical errors
-    true_positions = future_data['cross_distance_m'].values
-    rmse = np.sqrt(np.mean((np.array(predicted_positions) - true_positions) ** 2))
-    mae = np.mean(np.abs(np.array(predicted_positions) - true_positions))
-    
-    results.append({
-        'transect': target,
-        'site': target.split('_TS_')[0],
-        'zone': 'River' if is_river else 'Coast',
-        'rmse': rmse,
-        'mae': mae
-    })
-    
-    if (i + 1) % 50 == 0 or (i + 1) == len(valid_transects):
-        print(f"Progress: {i + 1} / {len(valid_transects)} transects evaluated...")
+# Scatter plot (Actual vs. Predicted)
+plt.scatter(df_eval.loc[mask_coast, target], df_eval.loc[mask_coast, 'pred_change'], 
+            alpha=0.4, label='Coastal', color='blue', s=15)
+plt.scatter(df_eval.loc[mask_river, target], df_eval.loc[mask_river, 'pred_change'], 
+            alpha=0.4, label='River/Estuary', color='green', s=15)
 
-# ---------------------------------------------------------
-# 4. STATISTICS AND FINAL REPORT
-# ---------------------------------------------------------
-df_results = pd.DataFrame(results)
-execution_time = time.time() - start_time
+# Dashed red line representing the "perfect" prediction (y = x)
+min_val = min(df_eval[target].min(), df_eval['pred_change'].min())
+max_val = max(df_eval[target].max(), df_eval['pred_change'].max())
+plt.plot([min_val, max_val], [min_val, max_val], 'r--', label='Perfect Prediction (Actual = Predicted)', linewidth=2)
 
-print("\n" + "=" * 60)
-print("                 PERFORMANCE REPORT")
-print("=" * 60)
-print(f"Execution time         : {execution_time:.1f} seconds")
-print(f"Tested transects       : {len(df_results)}")
-print("-" * 60)
-
-# Global metrics
-print(f"Global RMSE (Mean)     : {df_results['rmse'].mean():.2f} meters")
-print(f"Global MAE (Mean)      : {df_results['mae'].mean():.2f} meters")
-print("-" * 60)
-
-# Segmented metrics
-coast_results = df_results[df_results['zone'] == 'Coast']
-river_results = df_results[df_results['zone'] == 'River']
-
-if not coast_results.empty:
-    print(f"Coastal RMSE (Mean)    : {coast_results['rmse'].mean():.2f} meters ({len(coast_results)} transects)")
-if not river_results.empty:
-    print(f"River RMSE (Mean)      : {river_results['rmse'].mean():.2f} meters ({len(river_results)} transects)")
-
-print("-" * 60)
-
-# Success distribution
-excellent = len(df_results[df_results['rmse'] <= 10.0])
-acceptable = len(df_results[(df_results['rmse'] > 10.0) & (df_results['rmse'] <= 20.0)])
-failed = len(df_results[df_results['rmse'] > 20.0])
-
-print("Distribution of prediction scores (1-Year Horizon):")
-print(f"[Excellent]  (< 10m)   : {excellent} transects ({excellent/len(df_results)*100:.1f}%)")
-print(f"[Acceptable] (10-20m)  : {acceptable} transects ({acceptable/len(df_results)*100:.1f}%)")
-print(f"[Failed]     (> 20m)   : {failed} transects ({failed/len(df_results)*100:.1f}%)")
-print("=" * 60)
+plt.title("XGBoost Performance: Actual vs. Predicted Values", fontsize=14)
+plt.xlabel("Actual Shoreline Movement (m/month)", fontsize=12)
+plt.ylabel("AI Predicted Movement (m/month)", fontsize=12)
+plt.axhline(0, color='black', linewidth=0.5)
+plt.axvline(0, color='black', linewidth=0.5)
+plt.legend()
+plt.grid(True, linestyle=':', alpha=0.7)
+plt.tight_layout()
+plt.show()
