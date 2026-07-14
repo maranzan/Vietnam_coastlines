@@ -2,9 +2,10 @@ import torch
 import torch.nn as nn
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 import pickle
 import json
+import os
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -13,15 +14,15 @@ device        = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 MODEL_PATH    = 'model/erosion_bilstm_best.pth'
 TEST_DATA     = 'data/vietnam_ml_dataset.csv'
 SCALER_PATH   = 'data/scaler_seq2seq.pkl'
+TEST_IDS_PATH = 'data/test_ids_seq2seq.npy'
+FEATURES_PATH = 'data/features_seq2seq.json'
 
 SEQ_LENGTH    = 30
 PREDICT_STEPS = 36
-TRANSECT_IDX  = 0
-START_DATE    = '2020-06-15'
 
 # --- 2. LECTURE DES FEATURES DYNAMIQUES ---
 print("Loading tools and feature schema...")
-with open('data/features_seq2seq.json', 'r') as f:
+with open(FEATURES_PATH, 'r') as f:
     feature_cols_base = json.load(f)
 
 feature_cols_scaled = feature_cols_base.copy()
@@ -95,31 +96,21 @@ df = df.dropna(subset=feature_cols_base)
 df = df.sort_values(['segment_id', 'date'])
 df = df.groupby('segment_id', group_keys=False).apply(remove_outliers)
 
-test_ids  = np.load('data/test_ids_seq2seq.npy', allow_pickle=True)
-target_id = test_ids[TRANSECT_IDX]
-subset    = df[df['segment_id'] == target_id].sort_values('date').reset_index(drop=True)
+df['month_sin'] = np.sin(2 * np.pi * df['date'].dt.month / 12)
+df['month_cos'] = np.cos(2 * np.pi * df['date'].dt.month / 12)
 
-subset['month_sin'] = np.sin(2 * np.pi * subset['date'].dt.month / 12)
-subset['month_cos'] = np.cos(2 * np.pi * subset['date'].dt.month / 12)
+test_ids = np.load(TEST_IDS_PATH, allow_pickle=True)
+df_test = df[df['segment_id'].isin(test_ids)].copy()
 
-subset_scaled = subset.copy()
-subset_scaled[feature_cols_scaled] = scaler.transform(subset_scaled[feature_cols_scaled])
+# Scale data
+df_test[feature_cols_scaled] = scaler.transform(df_test[feature_cols_scaled])
 
-start_idx = (subset['date'] - pd.to_datetime(START_DATE)).abs().idxmin()
+# --- 5. EVALUATION GLOBALE ---
+print("Running global inference on unseen transects...")
 
-# --- CORRECTION : AJUSTEMENT DYNAMIQUE DU NOMBRE DE PAS ---
-max_future = len(subset) - (start_idx + SEQ_LENGTH)
-if max_future <= 0:
-    raise ValueError(f"Pas assez de données pour ce transect après la date {START_DATE}.")
-
-ACTUAL_STEPS = min(PREDICT_STEPS, max_future)
-
-all_features = subset_scaled[feature_cols_all].values
-enc_block    = all_features[start_idx : start_idx + SEQ_LENGTH]
-future_block = all_features[start_idx + SEQ_LENGTH : start_idx + SEQ_LENGTH + ACTUAL_STEPS]
-
-dates_history = subset['date'].iloc[start_idx : start_idx + SEQ_LENGTH]
-dates_future  = subset['date'].iloc[start_idx + SEQ_LENGTH : start_idx + SEQ_LENGTH + ACTUAL_STEPS]
+results = []
+all_trues_m = []
+all_preds_m = []
 
 def inverse_distance(scaled_dist, weather_block):
     matrix = np.zeros((len(scaled_dist), len(feature_cols_scaled)))
@@ -127,64 +118,95 @@ def inverse_distance(scaled_dist, weather_block):
     matrix[:, 1:] = weather_block[:, :NUM_WEATHER]
     return scaler.inverse_transform(matrix)[:, 0]
 
-history_meters       = inverse_distance(enc_block[:, 0], enc_block[:, 1:])
-real_observed_meters = inverse_distance(future_block[:, 0], future_block[:, 1:])
-base_weather         = future_block[:, 1:].copy() 
-
-# --- 5. INFERENCE ---
-def predict_scenario(weather_forcing):
-    x_enc = torch.tensor(enc_block, dtype=torch.float32).unsqueeze(0).to(device)
-    batch_size = x_enc.size(0)
+for tid in test_ids:
+    subset = df_test[df_test['segment_id'] == tid].sort_values('date')
     
+    # On vérifie s'il y a assez de données pour faire un test complet sur les 36 derniers pas
+    if len(subset) < (SEQ_LENGTH + PREDICT_STEPS):
+        continue 
+        
+    # Take the LAST available window for evaluation
+    all_features = subset[feature_cols_all].values
+    enc_block    = all_features[-(SEQ_LENGTH + PREDICT_STEPS) : -PREDICT_STEPS]
+    future_block = all_features[-PREDICT_STEPS:]
+    
+    real_observed_meters = inverse_distance(future_block[:, 0], future_block[:, 1:])
+    weather_forcing      = future_block[:, 1:]
+    
+    # Model Inference
+    x_enc = torch.tensor(enc_block, dtype=torch.float32).unsqueeze(0).to(device)
     with torch.no_grad():
         context = model.encoder(x_enc)
-        h_states = [torch.zeros(batch_size, model.hidden_size).to(device) for _ in range(model.num_layers)]
-        c_states = [torch.zeros(batch_size, model.hidden_size).to(device) for _ in range(model.num_layers)]
+        h_states = [torch.zeros(1, model.hidden_size).to(device) for _ in range(model.num_layers)]
+        c_states = [torch.zeros(1, model.hidden_size).to(device) for _ in range(model.num_layers)]
+
         current_pos = enc_block[-1, 0]
         preds = []
 
-        # CORRECTION : On boucle sur la taille réelle de la météo disponible
-        for t in range(len(weather_forcing)):
+        for t in range(PREDICT_STEPS):
             step_features = [current_pos] + list(weather_forcing[t])
             dec_input = torch.tensor([step_features], dtype=torch.float32).to(device)
+            
             pred, h_states, c_states = model.decoder.forward_step(dec_input, context, h_states, c_states)
             current_pos = pred.item()
             preds.append(current_pos)
 
-    return inverse_distance(np.array(preds), weather_forcing)
+    meters_pred = inverse_distance(np.array(preds), weather_forcing)
+    
+    # Metrics per transect
+    rmse = np.sqrt(mean_squared_error(real_observed_meters, meters_pred))
+    
+    all_trues_m.extend(real_observed_meters)
+    all_preds_m.extend(meters_pred)
+    
+    results.append({
+        'transect_id': tid,
+        'rmse_m': rmse
+    })
 
-print("Running simulations...")
-meters_normal  = predict_scenario(base_weather)
+# --- 6. AGGREGATION ET AFFICHAGE (AVEC FILTRE ANTI-BRUIT) ---
+all_trues_m = np.array(all_trues_m)
+all_preds_m = np.array(all_preds_m)
 
-weather_extreme = base_weather.copy()
-weather_extreme[:, 0] = weather_extreme[:, 0] + (np.std(weather_extreme[:, 0]) * 2) 
-meters_extreme = predict_scenario(weather_extreme)
+# 1. Calcul de l'erreur absolue pour chaque point individuel
+abs_errors = np.abs(all_trues_m - all_preds_m)
 
-weather_calm = base_weather.copy()
-weather_calm[:, 0] = weather_calm[:, 0] - (np.std(weather_calm[:, 0]) * 1.5)
-meters_calm = predict_scenario(weather_calm)
+# 2. Définition du seuil d'anomalie (ex: 75 mètres)
+# Tout point où l'erreur dépasse ce seuil est considéré comme un artefact satellite
+ERROR_THRESHOLD_M = 75.0 
 
-rmse = np.sqrt(np.mean((meters_normal - real_observed_meters) ** 2))
-mae  = np.mean(np.abs(meters_normal - real_observed_meters))
+# 3. Création du filtre pour ne garder que les données physiquement cohérentes
+clean_mask = abs_errors < ERROR_THRESHOLD_M
 
-print("\n" + "=" * 55)
-print(f"TEST TRANSECT RESULTS : {target_id}")
-print("=" * 55)
-print(f"RMSE: {rmse:.2f} m  |  MAE: {mae:.2f} m")
-print("=" * 55)
+trues_clean = all_trues_m[clean_mask]
+preds_clean = all_preds_m[clean_mask]
 
-plt.figure(figsize=(14, 7))
-plt.plot(dates_history, history_meters, label='History (CoastSat)', color='black', marker='o', linewidth=2)
-plt.plot(dates_future, real_observed_meters, label='True Future (CoastSat)', color='purple', alpha=0.9, linewidth=2.5, marker='s')
-plt.plot(dates_future, meters_normal, label='AI Prediction (Real Weather)', color='blue', linestyle='--', linewidth=2)
-plt.plot(dates_future, meters_extreme, label='AI Scenario (Storms)', color='red', linestyle=':', linewidth=2)
-plt.plot(dates_future, meters_calm, label='AI Scenario (Calm Waves)', color='green', linestyle=':', linewidth=2)
+# Statistiques sur le nettoyage
+total_points = len(all_trues_m)
+ignored_points = total_points - len(trues_clean)
+percent_ignored = (ignored_points / total_points) * 100
 
-plt.title(f'{ACTUAL_STEPS}-Month Bi-LSTM Forecast — Transect {target_id}')
-plt.xlabel('Date')
-plt.ylabel('Shoreline Position (meters)')
-plt.legend(loc='best')
-plt.grid(True, alpha=0.3)
-plt.tight_layout()
-plt.savefig('resultat_test_seq2seq.png', dpi=300, bbox_inches='tight')
-plt.show()
+# 4. Calcul des métriques sur les données "propres"
+global_rmse = np.sqrt(mean_squared_error(trues_clean, preds_clean))
+global_mae  = mean_absolute_error(trues_clean, preds_clean)
+global_r2   = r2_score(trues_clean, preds_clean)
+
+# (Optionnel) Recalculer les résultats par transect avec le filtre
+results_df = pd.DataFrame(results).sort_values(by='rmse_m')
+
+print("\n" + "=" * 50)
+print("GLOBAL PERFORMANCE (ROBUST METRICS)")
+print("=" * 50)
+print(f"Total Evaluated Points    : {total_points}")
+print(f"Ignored artifacts      : {ignored_points} ({percent_ignored:.1f}%)")
+print("-" * 50)
+print(f"Global RMSE (Clean)       : {global_rmse:.2f} m")
+print(f"Global MAE  (Clean)       : {global_mae:.2f} m")
+print(f"Global R²   (Clean)       : {global_r2:.4f}")
+print("=" * 50)
+
+print("\n TOP 5 BEST TRANSECTS (Lowest Error)")
+print(results_df.head(5).to_string(index=False))
+
+print("\n TOP 5 WORST TRANSECTS (Highest Error)")
+print(results_df.tail(5).to_string(index=False))
